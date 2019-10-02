@@ -1,6 +1,6 @@
 # Wazigate Tunnel
 
-The Wazigate Tunnel is a reverse HTTP over MQTT proxy for the Waziup Cloud platform. You can use this service to access you gateway remotly.
+The Wazigate Tunnel is a reverse HTTP over MQTT proxy for the Waziup Cloud platform. You can use this service to access your gateway remotely.
 Any incomming HTTP requests to this service will be forwarded to separate MQTT tunnel topics that are served by the gateways.
 
 # Environment Variables
