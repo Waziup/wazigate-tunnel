@@ -10,10 +10,13 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"io/ioutil"
 	"log"
+	"math/rand"
 	"net/http"
 	"os"
 	"strconv"
@@ -22,9 +25,12 @@ import (
 	"time"
 
 	"github.com/Waziup/waziup-tunnel/mqtt"
+	"golang.org/x/oauth2"
 )
 
 var counter int
+
+var CookieName = "WaziupTunnelToken"
 
 type Downstream struct {
 	body     []byte
@@ -71,9 +77,10 @@ func main() {
 			Username: username,
 			Password: password,
 		}
-		log.Printf("[MQTT ] Connecting to %q as %q...", addr, auth.Username)
 
-		newClient, err := mqtt.Dial(addr, "tunnel", true, auth, nil)
+		id := "tunnel-" + fmt.Sprintf("%f", rand.Float32())[2:]
+		log.Printf("[MQTT ] Connecting %q to %q as %q...", id, addr, auth.Username)
+		newClient, err := mqtt.Dial(addr, id, true, auth, nil)
 		if err != nil {
 			log.Printf("[MQTT ] Error %v", err)
 			time.Sleep(time.Second * 3)
@@ -160,27 +167,158 @@ func serve() {
 	if addr == "" {
 		addr = ":80"
 	}
+	log.Printf("Listening on %q.", addr)
 	log.Fatal(http.ListenAndServe(addr, http.HandlerFunc(handler)))
 }
 
+var www = http.FileServer(http.Dir("www"))
+
+var clientID, ClientSecret, RedirectURL, TokenURL, AuthURL string
+
 func handler(resp http.ResponseWriter, req *http.Request) {
-	uri := req.RequestURI
-	if len(uri) == 0 || uri[0] != '/' {
-		http.Error(resp, "Bad Request", 400)
-		return
+
+	if clientID == "" {
+		clientID = os.Getenv("WAZIUP_CLIENTID")
+		ClientSecret = os.Getenv("WAZIUP_CLIENTSECRET")
+		RedirectURL = os.Getenv("WAZIUP_REDIRECTURL")
+		TokenURL = os.Getenv("WAZIUP_TOKENURL")
+		AuthURL = os.Getenv("WAZIUP_AUTHURL")
 	}
-	i := strings.IndexRune(uri[1:], '/')
+
+	i := strings.IndexRune(req.URL.Path[1:], '/')
 	if i == -1 {
-		http.Error(resp, "Bad Request", 400)
+		www.ServeHTTP(resp, req)
 		return
 	}
-	if req.Header.Get("Connection") == "Upgrade" {
-		http.Error(resp, "Can not upgrade tunnel conenction.", http.StatusBadRequest)
+
+	gatewayID := req.URL.Path[1 : i+1]
+
+	oAuthConfig := &oauth2.Config{
+		ClientID:     clientID,
+		ClientSecret: ClientSecret,
+		RedirectURL:  RedirectURL + req.URL.Path,
+
+		Scopes: []string{},
+		Endpoint: oauth2.Endpoint{
+			TokenURL: TokenURL,
+			AuthURL:  AuthURL,
+		},
+	}
+
+	query := req.URL.Query()
+	sessState := query.Get("state")
+	if sessState == "state" {
+		sessCode := query.Get("code")
+
+		ctx := context.Background()
+		token, err := oAuthConfig.Exchange(ctx, sessCode)
+		if err == nil {
+			resp.Header().Set("Set-Cookie", CookieName+"="+token.AccessToken)
+			gateways, err := FetchGateways(token.AccessToken)
+			if err != nil {
+				http.Error(resp, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			sess := CreateSession(token.AccessToken)
+			sess.gateways = gateways
+			http.Redirect(resp, req, req.URL.Path, http.StatusSeeOther)
+			return
+		}
+
+		http.Error(resp, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	deviceID := uri[1 : i+1]
-	req.RequestURI = uri[i+1:]
-	proxy(deviceID, resp, req)
+
+	sessToken, err := req.Cookie(CookieName)
+	if err == nil {
+		sess := sessions[sessToken.Value]
+		if sess != nil {
+			perm := sess.gateways[gatewayID]
+			if perm == 0 {
+				http.Error(resp, "Not allowed to access this gateway.", http.StatusForbidden)
+				return
+			}
+			reqPerm := 0
+			switch req.Method {
+			case http.MethodPost, http.MethodPut, http.MethodDelete:
+				reqPerm |= PermUpdate
+			case http.MethodHead, http.MethodGet:
+				reqPerm |= PermDelete
+			}
+
+			if perm&reqPerm == 0 {
+				http.Error(resp, "Method not allowed.", http.StatusMethodNotAllowed)
+				return
+			}
+
+			if req.Header.Get("Connection") == "Upgrade" {
+				http.Error(resp, "Can not upgrade tunnel conenction.", http.StatusBadRequest)
+				return
+			}
+
+			req.RequestURI = req.RequestURI[i+1:]
+			proxy(gatewayID, resp, req)
+			return
+		}
+	}
+
+	// oAuthConfig.RedirectURL = "http://localhost:8080/?forward=" + url.QueryEscape(req.URL.Path)
+	url := oAuthConfig.AuthCodeURL("state", oauth2.AccessTypeOffline)
+	http.Redirect(resp, req, url, http.StatusSeeOther)
+}
+
+const (
+	// PermView is required to view gateways.
+	PermView = 1 << iota
+	// PermUpdate is required to update (manage) gateways.
+	PermUpdate
+	// PermDelete is required to delete gateways. (Not used right now.)
+	PermDelete
+)
+
+// FetchGateways lists all gateways and permissions for this token.
+func FetchGateways(token string) (map[string]int, error) {
+
+	auth := "Bearer " + token
+	resp := fetch("https://api.waziup.io/api/v2/auth/permissions/gateways", fetchInit{
+		method: http.MethodGet,
+		headers: map[string]string{
+			"Authorization": auth,
+		},
+	})
+	if !resp.ok {
+		return nil, fmt.Errorf("fetch %d: %s", resp.status, resp.statusText)
+	}
+
+	var body []struct {
+		Scopes   []string `json:"scopes"`
+		Resource string   `json:"resource"`
+	}
+
+	if err := resp.json(&body); err != nil {
+		return nil, fmt.Errorf("fetch decode: %s", err.Error())
+	}
+
+	gws := make(map[string]int, len(body))
+
+	for _, gw := range body {
+		perm := 0
+		for _, scope := range gw.Scopes {
+			switch scope {
+			case "gateways:view":
+				perm |= PermView
+			case "gateways:update":
+				perm |= PermUpdate
+			case "gateways:delete":
+				perm |= PermDelete
+			}
+		}
+		if perm != 0 {
+			gws[gw.Resource] = perm
+		}
+	}
+
+	return gws, nil
 }
 
 func proxy(deviceID string, resp http.ResponseWriter, req *http.Request) {
