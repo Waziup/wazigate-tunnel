@@ -187,6 +187,10 @@ func handler(resp http.ResponseWriter, req *http.Request) {
 
 	i := strings.IndexRune(req.URL.Path[1:], '/')
 	if i == -1 {
+		if req.URL.Path == "/gateways.json" {
+			serveGateways(resp, req)
+			return
+		}
 		www.ServeHTTP(resp, req)
 		return
 	}
@@ -213,7 +217,13 @@ func handler(resp http.ResponseWriter, req *http.Request) {
 		ctx := context.Background()
 		token, err := oAuthConfig.Exchange(ctx, sessCode)
 		if err == nil {
-			resp.Header().Set("Set-Cookie", CookieName+"="+token.AccessToken)
+			cookie := http.Cookie{
+				Name:  CookieName,
+				Value: token.AccessToken,
+				Path:  "/",
+			}
+			http.SetCookie(resp, &cookie)
+			// resp.Header().Set("Set-Cookie", CookieName+"="+token.AccessToken)
 			gateways, err := FetchGateways(token.AccessToken)
 			if err != nil {
 				http.Error(resp, err.Error(), http.StatusInternalServerError)
@@ -263,7 +273,7 @@ func handler(resp http.ResponseWriter, req *http.Request) {
 	}
 
 	// oAuthConfig.RedirectURL = "http://localhost:8080/?forward=" + url.QueryEscape(req.URL.Path)
-	url := oAuthConfig.AuthCodeURL("state", oauth2.AccessTypeOffline)
+	url := oAuthConfig.AuthCodeURL("state", oauth2.AccessTypeOffline, oauth2.SetAuthURLParam("response_mode", "query"))
 	http.Redirect(resp, req, url, http.StatusSeeOther)
 }
 
@@ -319,6 +329,23 @@ func FetchGateways(token string) (map[string]int, error) {
 	}
 
 	return gws, nil
+}
+
+func serveGateways(resp http.ResponseWriter, req *http.Request) {
+
+	sessToken, err := req.Cookie(CookieName)
+	if err != nil {
+		http.Error(resp, "login required", http.StatusUnauthorized)
+		return
+	}
+	sess := sessions[sessToken.Value]
+	if sess == nil {
+		http.Error(resp, "no session with that id", http.StatusNotFound)
+		return
+	}
+	resp.Header().Set("Content-Type", "application/json; charset=utf-8")
+	encoder := json.NewEncoder(resp)
+	encoder.Encode(sess.gateways)
 }
 
 func proxy(deviceID string, resp http.ResponseWriter, req *http.Request) {
