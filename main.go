@@ -253,7 +253,7 @@ func handler(resp http.ResponseWriter, req *http.Request) {
 			case http.MethodPost, http.MethodPut, http.MethodDelete:
 				reqPerm |= PermUpdate
 			case http.MethodHead, http.MethodGet:
-				reqPerm |= PermDelete
+				reqPerm |= PermView
 			}
 
 			if perm&reqPerm == 0 {
