@@ -5,7 +5,6 @@
 // Waziup-Gateways when they connected to the Waziup Cloud.
 //
 // Johann Forster, 2019
-//
 package main
 
 import (
@@ -381,7 +380,7 @@ func proxy(deviceID string, resp http.ResponseWriter, req *http.Request) {
 	upstream[ref] = pending
 	upstreamMutex.Unlock()
 
-	timeout := time.NewTimer(10 * time.Second)
+	timeout := time.NewTimer(120 * time.Second)
 	select {
 	case <-timeout.C:
 		http.Error(resp, "Gateway timeout.", http.StatusGatewayTimeout)
